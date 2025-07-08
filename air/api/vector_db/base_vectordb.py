@@ -4,9 +4,9 @@ Base module for Vector DB, supports upload and search
 
 import logging
 from abc import ABCMeta
-from typing import List
+from typing import List, Optional, Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from air.api.vector_db.vectordb_registry import VectorDBRegistry
 
@@ -20,7 +20,8 @@ class VectorDBConfig(BaseModel):
 
     type: str = Field(default="AzureAISearch", description="Type of the Vector DB")
     base_url: str = Field(..., description="Vector DB URL")
-    api_key: str = Field(..., description="API key required to access the vector DB")
+    api_key: Union[str, None] = Field(default=None, description="API key required to access the vector DB (for API key authentication)")
+    auth_method: Literal["api_key", "rbac"] = Field(default="api_key", description="Authentication method: 'api_key' for API key authentication or 'rbac' for Azure RBAC authentication")
     api_version: str = Field(default="2023-11-01", description="API Version")
     index: str = Field(..., description="Name of the vector db index")
     embedding_column: str = Field(
@@ -36,6 +37,15 @@ class VectorDBConfig(BaseModel):
         description="List of columns from which content should be returned in search results",
     )
     timeout: int = Field(default=60, description="Vector DB POST request timeout")
+
+    @model_validator(mode='after')
+    def validate_auth_config(self):
+        """Validate that the authentication configuration is correct"""
+        if self.auth_method == "api_key" and self.api_key is None:
+            raise ValueError("api_key is required when auth_method is 'api_key'")
+        if self.auth_method == "rbac" and self.api_key is not None:
+            logger.warning("api_key is ignored when auth_method is 'rbac'")
+        return self
 
 
 class VectorDBMeta(ABCMeta):
@@ -67,5 +77,6 @@ class BaseVectorDB(metaclass=VectorDBMeta):
     def __init__(self, vectordb_config: VectorDBConfig):
         self.url = vectordb_config.base_url
         self.api_key = vectordb_config.api_key
+        self.auth_method = vectordb_config.auth_method
         self.api_version = vectordb_config.api_version
         self.index = vectordb_config.index

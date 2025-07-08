@@ -1,10 +1,10 @@
 """
-Azure AI Search module, supports upload and vector search
+Azure AI Search module, supports upload and vector search with API key and RBAC authentication
 """
 
 import json
 import logging
-from typing import List
+from typing import List, Optional
 
 import requests
 from requests.exceptions import HTTPError
@@ -15,6 +15,15 @@ from tenacity import (
     wait_random_exponential,
 )
 
+try:
+    from azure.identity import DefaultAzureCredential
+    from azure.core.credentials import AccessToken
+    AZURE_IDENTITY_AVAILABLE = True
+except ImportError:
+    AZURE_IDENTITY_AVAILABLE = False
+    DefaultAzureCredential = None
+    AccessToken = None
+
 from air import auth
 from air.api.vector_db.base_vectordb import BaseVectorDB, VectorDBConfig
 from air.embeddings import EmbeddingsClient
@@ -24,7 +33,8 @@ logger = logging.getLogger(__name__)
 
 class AzureAISearch(BaseVectorDB):
     """
-    Class to upload data to vector DB, inherits from BaseVectorDB
+    Class to upload data to vector DB, inherits from BaseVectorDB.
+    Supports both API key and Azure RBAC authentication.
     """
 
     def __init__(self, vectordb_config: VectorDBConfig):
@@ -33,11 +43,65 @@ class AzureAISearch(BaseVectorDB):
         self.k = vectordb_config.top_k
         self.select = ", ".join(vectordb_config.content_column)
         self.timeout = vectordb_config.timeout
-        self.headers = {"Content-Type": "application/json", "api-key": self.api_key}
+        
+        # Initialize authentication
+        self._init_authentication()
+        
         self.search_url = f"{self.url}/indexes/{self.index}/docs/search?api-version={self.api_version}"
         self.index_url = (
             f"{self.url}/indexes/{self.index}/docs/index?api-version={self.api_version}"
         )
+
+    def _init_authentication(self):
+        """Initialize authentication based on the configured method"""
+        if self.auth_method == "api_key":
+            if not self.api_key:
+                raise ValueError("API key is required for API key authentication")
+            self.headers = {"Content-Type": "application/json", "api-key": self.api_key}
+            self.credential = None
+        elif self.auth_method == "rbac":
+            if not AZURE_IDENTITY_AVAILABLE:
+                raise ImportError(
+                    "azure-identity package is required for RBAC authentication. "
+                    "Install it with: pip install azure-identity"
+                )
+            self.credential = DefaultAzureCredential()
+            self.headers = {"Content-Type": "application/json"}
+            self._token_cache = None
+            self._token_expiry = None
+        else:
+            raise ValueError(f"Unsupported authentication method: {self.auth_method}")
+
+    def _get_auth_headers(self) -> dict:
+        """Get authentication headers based on the configured method"""
+        if self.auth_method == "api_key":
+            return self.headers
+        elif self.auth_method == "rbac":
+            return self._get_rbac_headers()
+
+    def _get_rbac_headers(self) -> dict:
+        """Get headers with Azure RBAC Bearer token"""
+        import time
+        
+        # Check if we need to refresh the token
+        current_time = time.time()
+        if (self._token_cache is None or 
+            self._token_expiry is None or 
+            current_time >= self._token_expiry - 300):  # Refresh 5 minutes before expiry
+            
+            try:
+                # Azure Cognitive Search scope for RBAC
+                token = self.credential.get_token("https://search.azure.com/.default")
+                self._token_cache = token.token
+                self._token_expiry = token.expires_on
+                logger.debug("Successfully obtained Azure RBAC token for Azure AI Search")
+            except Exception as e:
+                logger.error(f"Failed to obtain Azure RBAC token: {e}")
+                raise RuntimeError(f"Failed to authenticate with Azure RBAC: {e}")
+        
+        headers = self.headers.copy()
+        headers["Authorization"] = f"Bearer {self._token_cache}"
+        return headers
 
     @retry(
         retry=retry_if_exception_type(requests.exceptions.HTTPError),
@@ -57,14 +121,20 @@ class AzureAISearch(BaseVectorDB):
         try:
             rows = [dict(row, **{"@search.action": "upload"}) for row in rows]
             data = {"value": rows}
+            headers = self._get_auth_headers()
             response = requests.post(
-                self.index_url, headers=self.headers, json=data, timeout=self.timeout
+                self.index_url, headers=headers, json=data, timeout=self.timeout
             )
             response.raise_for_status()
             return True
         except HTTPError as http_err:
             logger.error(
                 "VectorDB upload request failed due to HTTP error: %s", http_err
+            )
+            return False
+        except Exception as e:
+            logger.error(
+                "VectorDB upload request failed due to error: %s", e
             )
             return False
 
@@ -125,9 +195,10 @@ class AzureAISearch(BaseVectorDB):
                 "select": self.select,
                 "vectorQueries": search_vectors,
             }
+            headers = self._get_auth_headers()
             response = requests.post(
                 url=self.search_url,
-                headers=self.headers,
+                headers=headers,
                 json=data,
                 timeout=self.timeout,
             )
@@ -141,4 +212,9 @@ class AzureAISearch(BaseVectorDB):
                 http_err,
             )
             logger.error("Failed to retrieve from Azure AI search API")
+            return []
+        except Exception as e:
+            logger.error(
+                "Azure AI Search DB search request failed due to error: %s", e
+            )
             return []
