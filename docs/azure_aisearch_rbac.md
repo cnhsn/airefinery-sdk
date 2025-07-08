@@ -189,7 +189,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 ## Example: Complete RBAC Workflow
 
-See `examples/azure_aisearch_rbac_example.py` for a complete example demonstrating:
+See `test_real_azure_search.py` for a complete example demonstrating:
 - Configuration setup
 - Document uploading
 - Vector search
